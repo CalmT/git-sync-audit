@@ -1,7 +1,10 @@
 import { spawn } from 'node:child_process';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 
 const HASH_PATTERN = /^[0-9a-f]{7,64}$/i;
+const syncOperations = new Map();
 
 function runGit(repoPath, args, { maxBuffer = 30 * 1024 * 1024 } = {}) {
   return new Promise((resolve, reject) => {
@@ -40,6 +43,55 @@ function assertPath(repoPath) {
 
 function assertRef(ref, branches) {
   if (!ref || !branches.includes(ref)) throw new Error(`分支不存在：${ref || '(空)'}`);
+}
+
+function assertHashes(hashes) {
+  if (!Array.isArray(hashes) || hashes.length === 0) throw new Error('请至少选择一个需要同步的提交。');
+  if (hashes.length > 100) throw new Error('单次最多同步 100 个提交，请分批操作。');
+  if (hashes.some((hash) => typeof hash !== 'string' || !HASH_PATTERN.test(hash))) {
+    throw new Error('待同步提交中包含无效的提交 ID。');
+  }
+}
+
+async function localBranches(repoPath) {
+  const output = await runGit(repoPath, ['for-each-ref', '--format=%(refname:short)', 'refs/heads']);
+  return output.split('\n').filter(Boolean);
+}
+
+function parseWorktrees(output) {
+  return output.trim().split(/\n\n+/).filter(Boolean).map((block) => {
+    const result = { path: '', branch: '' };
+    for (const line of block.split('\n')) {
+      if (line.startsWith('worktree ')) result.path = line.slice('worktree '.length);
+      if (line.startsWith('branch refs/heads/')) result.branch = line.slice('branch refs/heads/'.length);
+    }
+    return result;
+  });
+}
+
+async function cleanupSyncOperation(operation, deleteBranch = true) {
+  let worktreeRemoved = true;
+  try {
+    await runGit(operation.repoPath, ['worktree', 'remove', '--force', operation.worktreePath]);
+  } catch {
+    worktreeRemoved = false;
+  }
+  await rm(operation.tempRoot, { recursive: true, force: true });
+  if (!worktreeRemoved) {
+    try {
+      await runGit(operation.repoPath, ['worktree', 'prune']);
+    } catch {
+      // Branch cleanup below remains best-effort if Git metadata is already inconsistent.
+    }
+  }
+  if (deleteBranch) {
+    try {
+      await runGit(operation.repoPath, ['branch', '-D', operation.syncBranch]);
+    } catch {
+      // The safety branch may already have been removed manually.
+    }
+  }
+  syncOperations.delete(operation.id);
 }
 
 export async function inspectRepository(repoPath) {
@@ -191,4 +243,165 @@ export async function getCommitDetails(repoPath, hash) {
     stat,
     diff,
   };
+}
+
+export async function startSync(options) {
+  const { repoPath, source, target, commitHashes } = options ?? {};
+  assertPath(repoPath);
+  assertHashes(commitHashes);
+
+  const repo = await inspectRepository(repoPath);
+  assertRef(source, repo.branches);
+  const locals = await localBranches(repo.root);
+  assertRef(target, locals);
+  if (source === target) throw new Error('源分支和目标分支不能相同。');
+
+  const selected = [...new Set(commitHashes)];
+  const range = (await runGit(repo.root, ['rev-list', '--reverse', '--topo-order', source, `^${target}`]))
+    .split('\n')
+    .filter(Boolean);
+  const rangeSet = new Set(range);
+  const invalid = selected.filter((hash) => !rangeSet.has(hash));
+  if (invalid.length) throw new Error('部分提交已不在源分支的漏同步范围内，请重新检查后再同步。');
+
+  const patchStatuses = await cherryStatus(repo.root, source, target);
+  const equivalent = selected.filter((hash) => patchStatuses.get(hash) !== 'missing');
+  if (equivalent.length) {
+    throw new Error('部分提交在目标分支中已有等价改动。请使用补丁等价模式重新检查，避免重复同步。');
+  }
+
+  const orderedCommits = range.filter((hash) => selected.includes(hash));
+  for (const hash of orderedCommits) {
+    const parents = (await runGit(repo.root, ['rev-list', '--parents', '-n', '1', hash])).trim().split(/\s+/).slice(1);
+    if (parents.length > 1) throw new Error(`暂不支持直接同步合并提交：${hash.slice(0, 8)}`);
+  }
+
+  const baseTargetHash = (await runGit(repo.root, ['rev-parse', target])).trim();
+  const safeTarget = target.replace(/[^a-zA-Z0-9._-]+/g, '-').replace(/^-+|-+$/g, '') || 'target';
+  const operationId = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+  const syncBranch = `git-sync-audit/${safeTarget}-${operationId}`;
+  const tempRoot = await mkdtemp(path.join(tmpdir(), 'git-sync-audit-sync-'));
+  const worktreePath = path.join(tempRoot, 'worktree');
+  const operation = {
+    id: operationId,
+    repoPath: repo.root,
+    source,
+    target,
+    baseTargetHash,
+    syncBranch,
+    tempRoot,
+    worktreePath,
+    orderedCommits,
+    appliedCommits: [],
+    status: 'running',
+  };
+
+  try {
+    await runGit(repo.root, ['branch', syncBranch, target]);
+    await runGit(repo.root, ['worktree', 'add', '--quiet', worktreePath, syncBranch]);
+    syncOperations.set(operationId, operation);
+
+    for (const hash of orderedCommits) {
+      try {
+        await runGit(worktreePath, ['cherry-pick', '-x', hash]);
+        operation.appliedCommits.push(hash);
+      } catch (error) {
+        let conflicts = [];
+        try {
+          conflicts = (await runGit(worktreePath, ['diff', '--name-only', '--diff-filter=U']))
+            .split('\n')
+            .filter(Boolean);
+        } catch {
+          // Preserve the original cherry-pick failure when conflict discovery fails.
+        }
+        operation.status = 'conflict';
+        operation.failedCommit = hash;
+        operation.conflicts = conflicts;
+        operation.errorMessage = error instanceof Error ? error.message : String(error);
+        return {
+          operationId,
+          status: 'conflict',
+          source,
+          target,
+          baseTargetHash,
+          syncBranch,
+          orderedCommits,
+          appliedCommits: operation.appliedCommits,
+          failedCommit: hash,
+          conflicts,
+          message: conflicts.length
+            ? `同步在 ${hash.slice(0, 8)} 发生冲突。`
+            : `无法应用提交 ${hash.slice(0, 8)}。`,
+        };
+      }
+    }
+
+    operation.status = 'ready';
+    operation.resultHash = (await runGit(worktreePath, ['rev-parse', 'HEAD'])).trim();
+    return {
+      operationId,
+      status: 'ready',
+      source,
+      target,
+      baseTargetHash,
+      resultHash: operation.resultHash,
+      syncBranch,
+      orderedCommits,
+      appliedCommits: operation.appliedCommits,
+      conflicts: [],
+      message: `${orderedCommits.length} 个提交已在安全分支中验证成功。`,
+    };
+  } catch (error) {
+    await cleanupSyncOperation(operation);
+    throw error;
+  }
+}
+
+export async function finalizeSync(operationId) {
+  const operation = syncOperations.get(operationId);
+  if (!operation || operation.status !== 'ready') throw new Error('同步操作不存在或尚未准备完成。');
+
+  const currentTargetHash = (await runGit(operation.repoPath, ['rev-parse', operation.target])).trim();
+  if (currentTargetHash !== operation.baseTargetHash) {
+    throw new Error('目标分支在同步期间发生了变化。为避免覆盖新提交，请终止本次同步并重新检查。');
+  }
+
+  const worktrees = parseWorktrees(await runGit(operation.repoPath, ['worktree', 'list', '--porcelain']));
+  const targetWorktree = worktrees.find((item) => item.branch === operation.target);
+  if (targetWorktree) {
+    const status = await runGit(targetWorktree.path, ['status', '--porcelain=v1']);
+    if (status.trim()) throw new Error('目标分支所在工作区有未提交修改，请处理后再应用同步结果。');
+    await runGit(targetWorktree.path, ['merge', '--ff-only', operation.syncBranch]);
+  } else {
+    await runGit(operation.repoPath, [
+      'update-ref',
+      `refs/heads/${operation.target}`,
+      operation.resultHash,
+      operation.baseTargetHash,
+    ]);
+  }
+
+  const result = {
+    status: 'completed',
+    target: operation.target,
+    previousHash: operation.baseTargetHash,
+    resultHash: operation.resultHash,
+    appliedCommits: operation.appliedCommits,
+  };
+  await cleanupSyncOperation(operation);
+  return result;
+}
+
+export async function abortSync(operationId) {
+  const operation = syncOperations.get(operationId);
+  if (!operation) return { status: 'aborted' };
+  if (operation.status === 'conflict') {
+    try {
+      await runGit(operation.worktreePath, ['cherry-pick', '--abort']);
+    } catch {
+      // Cleanup still removes the isolated worktree and safety branch.
+    }
+  }
+  await cleanupSyncOperation(operation);
+  return { status: 'aborted' };
 }

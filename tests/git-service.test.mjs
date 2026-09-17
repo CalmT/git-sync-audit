@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { compareBranches, getCommitDetails, inspectRepository } from '../electron/git-service.mjs';
+import { abortSync, compareBranches, finalizeSync, getCommitDetails, inspectRepository, startSync } from '../electron/git-service.mjs';
 
 const exec = promisify(execFile);
 
@@ -58,6 +58,10 @@ test('detects missing and patch-equivalent commits without changing the reposito
   assert.equal(patchReport.summary.equivalent, 1);
   assert.equal(patchReport.results.find((item) => item.hash === missingHash)?.status, 'missing');
   assert.equal(patchReport.results.find((item) => item.hash === equivalentSourceHash)?.status, 'equivalent');
+  await assert.rejects(
+    startSync({ repoPath: repo, source: 'release', target: 'main', commitHashes: [equivalentSourceHash] }),
+    /已有等价改动/,
+  );
 
   const strictReport = await compareBranches({
     repoPath: repo,
@@ -90,4 +94,50 @@ test('rejects equal source and target branches', async (t) => {
     compareBranches({ repoPath: repo, source: 'main', target: 'main', mode: 'patch' }),
     /不能相同/,
   );
+});
+
+test('syncs selected commits through an isolated branch before fast-forwarding the target', async (t) => {
+  const repo = await mkdtemp(path.join(tmpdir(), 'git-sync-audit-sync-success-'));
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  await git(repo, 'init', '-b', 'main');
+  await git(repo, 'config', 'user.name', 'Sync Tester');
+  await git(repo, 'config', 'user.email', 'sync@example.com');
+  const baseHash = await commitFile(repo, 'base.txt', 'base\n', 'base commit');
+  await git(repo, 'checkout', '-b', 'feature');
+  const featureHash = await commitFile(repo, 'feature.txt', 'feature\n', 'feature commit');
+  await git(repo, 'checkout', 'main');
+
+  const sync = await startSync({ repoPath: repo, source: 'feature', target: 'main', commitHashes: [featureHash] });
+  assert.equal(sync.status, 'ready');
+  assert.deepEqual(sync.appliedCommits, [featureHash]);
+  assert.equal(await git(repo, 'rev-parse', 'main'), baseHash);
+  assert.match(await git(repo, 'branch', '--list', sync.syncBranch), /git-sync-audit\//);
+
+  const completed = await finalizeSync(sync.operationId);
+  assert.equal(completed.status, 'completed');
+  assert.equal(await git(repo, 'rev-parse', 'main'), completed.resultHash);
+  assert.equal(await git(repo, 'branch', '--list', sync.syncBranch), '');
+  assert.match(await git(repo, 'log', '-1', '--format=%B'), new RegExp(`cherry picked from commit ${featureHash}`));
+});
+
+test('keeps the target unchanged and can clean up after a cherry-pick conflict', async (t) => {
+  const repo = await mkdtemp(path.join(tmpdir(), 'git-sync-audit-sync-conflict-'));
+  t.after(() => rm(repo, { recursive: true, force: true }));
+  await git(repo, 'init', '-b', 'main');
+  await git(repo, 'config', 'user.name', 'Sync Tester');
+  await git(repo, 'config', 'user.email', 'sync@example.com');
+  await commitFile(repo, 'shared.txt', 'base\n', 'base commit');
+  await git(repo, 'checkout', '-b', 'feature');
+  const featureHash = await commitFile(repo, 'shared.txt', 'source change\n', 'source change');
+  await git(repo, 'checkout', 'main');
+  const targetHash = await commitFile(repo, 'shared.txt', 'target change\n', 'target change');
+
+  const sync = await startSync({ repoPath: repo, source: 'feature', target: 'main', commitHashes: [featureHash] });
+  assert.equal(sync.status, 'conflict');
+  assert.deepEqual(sync.conflicts, ['shared.txt']);
+  assert.equal(await git(repo, 'rev-parse', 'main'), targetHash);
+
+  await abortSync(sync.operationId);
+  assert.equal(await git(repo, 'branch', '--list', sync.syncBranch), '');
+  assert.equal(await git(repo, 'rev-parse', 'main'), targetHash);
 });

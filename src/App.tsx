@@ -13,6 +13,7 @@ import {
   FolderGit2,
   GitBranch,
   GitCommitHorizontal,
+  GitMerge,
   LoaderCircle,
   Maximize2,
   Minimize2,
@@ -20,11 +21,13 @@ import {
   Search,
   Settings2,
   ShieldCheck,
+  Square,
+  SquareCheckBig,
   Sparkles,
   UserRound,
   X,
 } from 'lucide-react';
-import type { AiReview, AuditReport, CommitDetails, CommitResult, CommitStatus, CompareOptions, RepositoryInfo, ReviewSeverity } from './types';
+import type { AiReview, AuditReport, CommitDetails, CommitResult, CommitStatus, CompareOptions, RepositoryInfo, ReviewSeverity, SyncCompletion, SyncResult } from './types';
 import Lightfall from './components/Lightfall';
 
 const statusMeta: Record<CommitStatus, { label: string; className: string; icon: typeof AlertCircle }> = {
@@ -187,6 +190,12 @@ export default function App() {
   const [reviewBusy, setReviewBusy] = useState(false);
   const [aiReview, setAiReview] = useState<AiReview | null>(null);
   const [detailsExpanded, setDetailsExpanded] = useState(false);
+  const [syncSelection, setSyncSelection] = useState<Set<string>>(new Set());
+  const [syncOpen, setSyncOpen] = useState(false);
+  const [syncConsent, setSyncConsent] = useState(false);
+  const [syncBusy, setSyncBusy] = useState(false);
+  const [syncResult, setSyncResult] = useState<SyncResult | null>(null);
+  const [syncCompletion, setSyncCompletion] = useState<SyncCompletion | null>(null);
 
   useEffect(() => {
     window.gitAudit.loadAiSettings().then((settings) => {
@@ -215,6 +224,7 @@ export default function App() {
       setSelected(null);
       setDetails(null);
       setAiReview(null);
+      setSyncSelection(new Set());
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -244,6 +254,7 @@ export default function App() {
       const nextReport = await window.gitAudit.compare(options);
       setReport(nextReport);
       setStatusFilter('all');
+      setSyncSelection(new Set());
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
     } finally {
@@ -361,6 +372,89 @@ export default function App() {
     });
   }, [report, search, statusFilter]);
 
+  const selectedSyncCommits = useMemo(
+    () => (report?.results ?? []).filter((item) => item.status === 'missing' && syncSelection.has(item.hash)),
+    [report, syncSelection],
+  );
+
+  const toggleSyncCommit = (hash: string) => {
+    setSyncSelection((current) => {
+      const next = new Set(current);
+      if (next.has(hash)) next.delete(hash);
+      else next.add(hash);
+      return next;
+    });
+  };
+
+  const toggleAllMissing = () => {
+    const missing = (report?.results ?? []).filter((item) => item.status === 'missing').map((item) => item.hash);
+    setSyncSelection((current) => current.size === missing.length ? new Set() : new Set(missing));
+  };
+
+  const openSync = () => {
+    if (!selectedSyncCommits.length) {
+      setError('请先勾选至少一个确认漏同步的提交。');
+      return;
+    }
+    setSyncConsent(false);
+    setSyncResult(null);
+    setSyncCompletion(null);
+    setSyncOpen(true);
+  };
+
+  const startSafeSync = async () => {
+    if (!repo || !report || !syncConsent) return;
+    setSyncBusy(true);
+    setError('');
+    try {
+      const result = await window.gitAudit.startSync({
+        repoPath: repo.root,
+        source: report.source,
+        target: report.target,
+        commitHashes: selectedSyncCommits.map((item) => item.hash),
+      });
+      setSyncResult(result);
+    } catch (cause) {
+      setError(readableError(cause));
+    } finally {
+      setSyncBusy(false);
+    }
+  };
+
+  const finalizeSafeSync = async () => {
+    if (!syncResult) return;
+    setSyncBusy(true);
+    setError('');
+    try {
+      const completion = await window.gitAudit.finalizeSync(syncResult.operationId);
+      setSyncCompletion(completion);
+      setSyncSelection(new Set());
+      await runAudit();
+    } catch (cause) {
+      setError(readableError(cause));
+    } finally {
+      setSyncBusy(false);
+    }
+  };
+
+  const abortSafeSync = async () => {
+    if (!syncResult) {
+      setSyncOpen(false);
+      return;
+    }
+    setSyncBusy(true);
+    setError('');
+    try {
+      await window.gitAudit.abortSync(syncResult.operationId);
+      setSyncResult(null);
+      setSyncOpen(false);
+    } catch (cause) {
+      setError(readableError(cause));
+    } finally {
+      setSyncBusy(false);
+    }
+  };
+
   const exportReport = async (format: 'json' | 'markdown') => {
     if (!report) return;
     const content = format === 'json' ? JSON.stringify(report, null, 2) : reportToMarkdown(report);
@@ -382,7 +476,7 @@ export default function App() {
         <div className="topbar-actions">
           <button className="ghost" onClick={() => setSettingsOpen(true)}><BrainCircuit size={16} /> AI 设置</button>
           {repo && <button className="ghost" onClick={chooseRepository}><RefreshCw size={16} /> 更换仓库</button>}
-          <span className="read-only"><ShieldCheck size={15} /> 只读模式</span>
+          <span className="read-only"><ShieldCheck size={15} /> 检查只读 · 同步需确认</span>
         </div>
       </header>
 
@@ -443,7 +537,7 @@ export default function App() {
               <div className="preflight">
                 <div className="preflight-icon"><GitCommitHorizontal size={30} /></div>
                 <h2>准备检查分支同步情况</h2>
-                <p>选择左侧条件并开始检查。分析只会读取提交历史，不会切换或修改任何分支。</p>
+                <p>选择左侧条件并开始检查。分析阶段只读取提交历史；只有主动选择提交并二次确认后才会执行同步。</p>
                 <div className="branch-route"><code>{source || '源分支'}</code><ArrowRight size={18} /><code>{target || '目标分支'}</code></div>
               </div>
             ) : (
@@ -464,7 +558,11 @@ export default function App() {
 
                 <div className="list-toolbar">
                   <div className="search-box"><Search size={16} /><input placeholder="搜索提交、作者或文件…" value={search} onChange={(e) => setSearch(e.target.value)} />{search && <button onClick={() => setSearch('')}><X size={14} /></button>}</div>
-                  <span>{filteredResults.length} 条记录</span>
+                  <div className="sync-toolbar">
+                    {report.summary.missing > 0 && <button className="select-missing" onClick={toggleAllMissing}>{syncSelection.size === report.summary.missing ? '取消全选' : '选择全部漏同步'}</button>}
+                    <button className="sync-trigger" disabled={selectedSyncCommits.length === 0} onClick={openSync}><GitMerge size={14} /> 安全同步{selectedSyncCommits.length ? ` (${selectedSyncCommits.length})` : ''}</button>
+                    <span>{filteredResults.length} 条记录</span>
+                  </div>
                 </div>
 
                 <div className="commit-list">
@@ -472,12 +570,19 @@ export default function App() {
                     const meta = statusMeta[commit.status];
                     const StatusIcon = meta.icon;
                     return (
-                      <button key={commit.hash} className={`commit-row ${selected?.hash === commit.hash ? 'selected' : ''}`} onClick={() => selectCommit(commit)}>
-                        <span className={`status-icon ${meta.className}`}><StatusIcon size={16} /></span>
-                        <span className="commit-main"><strong>{commit.subject}</strong><span><code>{commit.shortHash}</code> · {commit.authorName} · {formatDate(commit.authoredAt)}</span></span>
-                        <span className="file-count"><FileCode2 size={14} /> {commit.files.length}</span>
-                        <span className={`status-pill ${meta.className}`}>{meta.label}</span>
-                      </button>
+                      <div key={commit.hash} className={`commit-row ${selected?.hash === commit.hash ? 'selected' : ''} ${syncSelection.has(commit.hash) ? 'sync-selected' : ''}`}>
+                        {commit.status === 'missing' ? (
+                          <button className="sync-checkbox" title={syncSelection.has(commit.hash) ? '取消同步此提交' : '选择同步此提交'} onClick={() => toggleSyncCommit(commit.hash)}>
+                            {syncSelection.has(commit.hash) ? <SquareCheckBig size={18} /> : <Square size={18} />}
+                          </button>
+                        ) : <span className="sync-checkbox-spacer" />}
+                        <button className="commit-open" onClick={() => selectCommit(commit)}>
+                          <span className={`status-icon ${meta.className}`}><StatusIcon size={16} /></span>
+                          <span className="commit-main"><strong>{commit.subject}</strong><span><code>{commit.shortHash}</code> · {commit.authorName} · {formatDate(commit.authoredAt)}</span></span>
+                          <span className="file-count"><FileCode2 size={14} /> {commit.files.length}</span>
+                          <span className={`status-pill ${meta.className}`}>{meta.label}</span>
+                        </button>
+                      </div>
                     );
                   })}
                 </div>
@@ -525,6 +630,63 @@ export default function App() {
               )}
             </aside>
           )}
+        </div>
+      )}
+
+      {syncOpen && (
+        <div className="modal-backdrop" onMouseDown={(event) => { if (event.target === event.currentTarget && (!syncResult || syncCompletion)) setSyncOpen(false); }}>
+          <div className="settings-modal sync-modal" role="dialog" aria-modal="true" aria-label="安全同步提交">
+            <div className="modal-heading">
+              <div className="modal-icon sync-modal-icon"><GitMerge size={21} /></div>
+              <div><h2>安全同步提交</h2><p>{report?.source} → {report?.target}</p></div>
+              {(!syncResult || syncCompletion) && <button className="icon-button" onClick={() => setSyncOpen(false)}><X size={17} /></button>}
+            </div>
+
+            {syncCompletion ? (
+              <div className="sync-finished">
+                <div className="sync-state-icon success"><Check size={25} /></div>
+                <h3>同步已完成</h3>
+                <p>{syncCompletion.appliedCommits.length} 个提交已经安全地应用到本地目标分支 <code>{syncCompletion.target}</code>。</p>
+                <div className="sync-hash-route"><code>{syncCompletion.previousHash.slice(0, 8)}</code><ArrowRight size={15} /><code>{syncCompletion.resultHash.slice(0, 8)}</code></div>
+                <p className="sync-no-push"><ShieldCheck size={13} /> 仅更新本地分支，没有推送远程仓库。</p>
+                <button className="primary modal-save" onClick={() => setSyncOpen(false)}>完成</button>
+              </div>
+            ) : !syncResult ? (
+              <>
+                <div className="sync-safety-note"><ShieldCheck size={18} /><div><strong>先在隔离分支验证，再修改目标分支</strong><span>工具会按依赖顺序执行 cherry-pick。冲突或目标分支变化时自动停止，不会强制覆盖。</span></div></div>
+                <div className="sync-plan-heading"><strong>待同步提交</strong><span>{selectedSyncCommits.length} 个</span></div>
+                <div className="sync-commit-list">
+                  {selectedSyncCommits.map((commit) => <div key={commit.hash}><code>{commit.shortHash}</code><span>{commit.subject}</span></div>)}
+                </div>
+                <label className="sync-consent"><input type="checkbox" checked={syncConsent} onChange={(event) => setSyncConsent(event.target.checked)} /><span>我已确认这些提交需要同步到本地目标分支 <code>{report?.target}</code></span></label>
+                <div className="sync-modal-actions">
+                  <button className="secondary" disabled={syncBusy} onClick={() => setSyncOpen(false)}>取消</button>
+                  <button className="primary" disabled={syncBusy || !syncConsent} onClick={startSafeSync}>{syncBusy ? <LoaderCircle className="spin" size={16} /> : <GitMerge size={16} />}{syncBusy ? '正在隔离验证…' : '创建安全同步分支'}</button>
+                </div>
+              </>
+            ) : syncResult.status === 'conflict' ? (
+              <div className="sync-result-state conflict">
+                <div className="sync-state-icon danger"><AlertCircle size={25} /></div>
+                <h3>同步遇到冲突</h3>
+                <p>{syncResult.message} 目标分支尚未发生任何变化。</p>
+                <div className="sync-result-meta"><span>失败提交</span><code>{syncResult.failedCommit?.slice(0, 8)}</code><span>安全分支</span><code>{syncResult.syncBranch}</code></div>
+                {syncResult.conflicts.length > 0 && <div className="conflict-files"><strong>冲突文件</strong>{syncResult.conflicts.map((file) => <code key={file}>{file}</code>)}</div>}
+                <button className="danger-button" disabled={syncBusy} onClick={abortSafeSync}>{syncBusy ? <LoaderCircle className="spin" size={16} /> : <X size={16} />}{syncBusy ? '正在清理…' : '终止并清理本次同步'}</button>
+              </div>
+            ) : (
+              <div className="sync-result-state ready">
+                <div className="sync-state-icon success"><Check size={25} /></div>
+                <h3>隔离验证成功</h3>
+                <p>{syncResult.appliedCommits.length} 个提交已成功应用到安全分支，目标分支仍保持不变。</p>
+                <div className="sync-result-meta"><span>安全分支</span><code>{syncResult.syncBranch}</code><span>目标提交</span><code>{syncResult.resultHash?.slice(0, 8)}</code></div>
+                <div className="sync-final-warning"><AlertCircle size={15} /><span>下一步会更新本地目标分支 <code>{syncResult.target}</code>，但不会推送远程。</span></div>
+                <div className="sync-modal-actions">
+                  <button className="secondary" disabled={syncBusy} onClick={abortSafeSync}>取消并清理</button>
+                  <button className="primary" disabled={syncBusy} onClick={finalizeSafeSync}>{syncBusy ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}{syncBusy ? '正在更新目标分支…' : `确认同步到 ${syncResult.target}`}</button>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       )}
 

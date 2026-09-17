@@ -1,7 +1,7 @@
 import { app, BrowserWindow, dialog, ipcMain, net } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { inspectRepository, compareBranches, getCommitDetails } from './git-service.mjs';
+import { abortSync, compareBranches, finalizeSync, getCommitDetails, inspectRepository, startSync } from './git-service.mjs';
 import { listAvailableModels, reviewCommit } from './ai-review-service.mjs';
 import { clearSavedApiKey, loadAiSettings, resolveApiKey, saveAiSettings } from './settings-store.mjs';
 import { writeFile } from 'node:fs/promises';
@@ -43,6 +43,9 @@ function registerHandlers() {
   ipcMain.handle('repo:inspect', (_event, repoPath) => inspectRepository(repoPath));
   ipcMain.handle('repo:compare', (_event, options) => compareBranches(options));
   ipcMain.handle('repo:commit-details', (_event, repoPath, hash) => getCommitDetails(repoPath, hash));
+  ipcMain.handle('repo:sync-start', (_event, options) => startSync(options));
+  ipcMain.handle('repo:sync-finalize', (_event, operationId) => finalizeSync(operationId));
+  ipcMain.handle('repo:sync-abort', (_event, operationId) => abortSync(operationId));
   ipcMain.handle('ai:review-commit', async (_event, { repoPath, hash, apiKey, model }) => {
     const details = await getCommitDetails(repoPath, hash);
     const resolvedApiKey = await resolveApiKey(apiKey);

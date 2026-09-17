@@ -82,11 +82,37 @@ export type CompareOptions = {
   mode: 'strict' | 'patch';
 };
 
+export type SyncResult = {
+  operationId: string;
+  status: 'ready' | 'conflict';
+  source: string;
+  target: string;
+  baseTargetHash: string;
+  resultHash?: string;
+  syncBranch: string;
+  orderedCommits: string[];
+  appliedCommits: string[];
+  failedCommit?: string;
+  conflicts: string[];
+  message: string;
+};
+
+export type SyncCompletion = {
+  status: 'completed';
+  target: string;
+  previousHash: string;
+  resultHash: string;
+  appliedCommits: string[];
+};
+
 export type GitAuditApi = {
   selectRepository(): Promise<string | null>;
   inspectRepository(path: string): Promise<RepositoryInfo>;
   compare(options: CompareOptions): Promise<AuditReport>;
   getCommitDetails(repoPath: string, hash: string): Promise<CommitDetails>;
+  startSync(options: { repoPath: string; source: string; target: string; commitHashes: string[] }): Promise<SyncResult>;
+  finalizeSync(operationId: string): Promise<SyncCompletion>;
+  abortSync(operationId: string): Promise<{ status: 'aborted' }>;
   reviewCommit(options: { repoPath: string; hash: string; apiKey: string; model: string }): Promise<AiReview>;
   listModels(apiKey?: string): Promise<string[]>;
   loadAiSettings(): Promise<{ model: string; rememberApiKey: boolean; hasApiKey: boolean }>;
