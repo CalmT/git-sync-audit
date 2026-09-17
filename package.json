@@ -1,6 +1,6 @@
 {
   "name": "git-sync-audit",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "private": true,
   "description": "A desktop app for finding commits that have not been synchronized between Git branches.",
   "type": "module",

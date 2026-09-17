@@ -139,9 +139,9 @@ function DiffView({ diff }: { diff: string }) {
   );
 }
 
-function EmptyState({ recentRepositories, restoring, onChoose, onOpen, onForget }: {
+function EmptyState({ recentRepositories, loading, onChoose, onOpen, onForget }: {
   recentRepositories: RecentRepository[];
-  restoring: boolean;
+  loading: boolean;
   onChoose: () => void;
   onOpen: (repoPath: string) => void;
   onForget: (repoPath: string) => void;
@@ -152,12 +152,12 @@ function EmptyState({ recentRepositories, restoring, onChoose, onOpen, onForget 
       <div className="eyebrow">LOCAL · SAFE · EXPLAINABLE</div>
       <h1>找出没有同步的提交</h1>
       <p>比较两个 Git 分支，识别真正遗漏的改动，同时排除 cherry-pick 和 rebase 造成的假象。</p>
-      <button className="primary large" disabled={restoring} onClick={onChoose}>
-        {restoring ? <LoaderCircle className="spin" size={19} /> : <FolderGit2 size={19} />}
-        {restoring ? '正在打开上次的仓库…' : '选择本地仓库'}
+      <button className="primary large" disabled={loading} onClick={onChoose}>
+        {loading ? <LoaderCircle className="spin" size={19} /> : <FolderGit2 size={19} />}
+        {loading ? '正在读取最近仓库…' : '选择本地仓库'}
       </button>
-      {recentRepositories.length > 0 && !restoring && <div className="recent-repositories">
-        <div className="recent-heading"><span>最近仓库</span><small>启动时自动打开最近一次使用的仓库</small></div>
+      {recentRepositories.length > 0 && !loading && <div className="recent-repositories">
+        <div className="recent-heading"><span>最近仓库</span><small>点击后进入仓库界面</small></div>
         {recentRepositories.map((item) => <div className="recent-repository" key={item.path}>
           <button className="recent-open" title={item.path} onClick={() => onOpen(item.path)}><FolderGit2 size={16} /><span><strong>{item.name}</strong><small>{item.path}</small></span></button>
           <button className="recent-forget" title="从最近记录中移除" onClick={() => onForget(item.path)}><X size={14} /></button>
@@ -211,11 +211,10 @@ export default function App() {
   const [syncResult, setSyncResult] = useState<SyncResult | null>(null);
   const [syncCompletion, setSyncCompletion] = useState<SyncCompletion | null>(null);
   const [recentRepositories, setRecentRepositories] = useState<RecentRepository[]>([]);
-  const [restoringRepository, setRestoringRepository] = useState(true);
+  const [loadingRepositoryHistory, setLoadingRepositoryHistory] = useState(true);
 
-  const loadRepository = async (repoPath: string, restoring = false) => {
+  const loadRepository = async (repoPath: string) => {
     setBusy(true);
-    if (restoring) setRestoringRepository(true);
     setError('');
     try {
       const info = await window.gitAudit.inspectRepository(repoPath);
@@ -232,12 +231,9 @@ export default function App() {
       setRecentRepositories(history.recentRepositories);
     } catch (cause) {
       setRepo(null);
-      setError(restoring
-        ? `无法自动打开上次使用的仓库：${readableError(cause)}`
-        : readableError(cause));
+      setError(readableError(cause));
     } finally {
       setBusy(false);
-      if (restoring) setRestoringRepository(false);
     }
   };
 
@@ -256,10 +252,9 @@ export default function App() {
   useEffect(() => {
     window.gitAudit.loadRepositoryHistory().then((history) => {
       setRecentRepositories(history.recentRepositories);
-      if (history.lastRepository) void loadRepository(history.lastRepository, true);
-      else setRestoringRepository(false);
+      setLoadingRepositoryHistory(false);
     }).catch((cause) => {
-      setRestoringRepository(false);
+      setLoadingRepositoryHistory(false);
       setError(readableError(cause));
     });
   }, []);
@@ -531,7 +526,7 @@ export default function App() {
         <div className="error-banner"><AlertCircle size={17} /><span>{error}</span><button onClick={() => setError('')}><X size={16} /></button></div>
       )}
 
-      {!repo ? <EmptyState recentRepositories={recentRepositories} restoring={restoringRepository} onChoose={chooseRepository} onOpen={(repoPath) => void loadRepository(repoPath)} onForget={(repoPath) => void forgetRecentRepository(repoPath)} /> : (
+      {!repo ? <EmptyState recentRepositories={recentRepositories} loading={loadingRepositoryHistory} onChoose={chooseRepository} onOpen={(repoPath) => void loadRepository(repoPath)} onForget={(repoPath) => void forgetRecentRepository(repoPath)} /> : (
         <div className={`workspace ${detailsExpanded ? 'details-expanded' : ''}`}>
           <aside className="control-panel">
             <div className="panel-heading"><div><span>检查条件</span><p>定义提交的同步方向</p></div><Settings2 size={19} /></div>

@@ -111,11 +111,7 @@ function normalizedRepositories(settings) {
 export async function loadRepositoryHistory() {
   const settings = await readSettingsFile();
   const recentRepositories = normalizedRepositories(settings);
-  const lastRepository = typeof settings.lastRepository === 'string'
-    && recentRepositories.some((item) => item.path === settings.lastRepository)
-    ? settings.lastRepository
-    : recentRepositories[0]?.path || null;
-  return { lastRepository, recentRepositories };
+  return { recentRepositories };
 }
 
 export async function rememberRepository({ path: repoPath, name }) {
@@ -127,20 +123,18 @@ export async function rememberRepository({ path: repoPath, name }) {
     lastOpenedAt: new Date().toISOString(),
   };
   const recentRepositories = [entry, ...normalizedRepositories(settings).filter((item) => item.path !== repoPath)].slice(0, 8);
-  await writeSettingsFile({ ...settings, lastRepository: repoPath, recentRepositories });
-  return { lastRepository: repoPath, recentRepositories };
+  const next = { ...settings, recentRepositories };
+  delete next.lastRepository;
+  await writeSettingsFile(next);
+  return { recentRepositories };
 }
 
 export async function forgetRepository(repoPath) {
   if (typeof repoPath !== 'string' || !path.isAbsolute(repoPath)) throw new Error('仓库路径无效。');
   const settings = await readSettingsFile();
   const recentRepositories = normalizedRepositories(settings).filter((item) => item.path !== repoPath);
-  const lastRepository = settings.lastRepository === repoPath
-    ? recentRepositories[0]?.path || null
-    : settings.lastRepository || recentRepositories[0]?.path || null;
   const next = { ...settings, recentRepositories };
-  if (lastRepository) next.lastRepository = lastRepository;
-  else delete next.lastRepository;
+  delete next.lastRepository;
   await writeSettingsFile(next);
-  return { lastRepository, recentRepositories };
+  return { recentRepositories };
 }
