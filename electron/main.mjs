@@ -3,7 +3,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { abortSync, compareBranches, finalizeSync, getCommitDetails, inspectRepository, startSync } from './git-service.mjs';
 import { listAvailableModels, reviewCommit } from './ai-review-service.mjs';
-import { clearSavedApiKey, loadAiSettings, resolveApiKey, saveAiSettings } from './settings-store.mjs';
+import { clearSavedApiKey, forgetRepository, loadAiSettings, loadRepositoryHistory, rememberRepository, resolveApiKey, saveAiSettings } from './settings-store.mjs';
 import { writeFile } from 'node:fs/promises';
 
 const currentDir = path.dirname(fileURLToPath(import.meta.url));
@@ -40,7 +40,13 @@ function registerHandlers() {
     return result.canceled ? null : result.filePaths[0];
   });
 
-  ipcMain.handle('repo:inspect', (_event, repoPath) => inspectRepository(repoPath));
+  ipcMain.handle('repo:inspect', async (_event, repoPath) => {
+    const repository = await inspectRepository(repoPath);
+    await rememberRepository({ path: repository.root, name: repository.name });
+    return repository;
+  });
+  ipcMain.handle('repo:history', () => loadRepositoryHistory());
+  ipcMain.handle('repo:forget', (_event, repoPath) => forgetRepository(repoPath));
   ipcMain.handle('repo:compare', (_event, options) => compareBranches(options));
   ipcMain.handle('repo:commit-details', (_event, repoPath, hash) => getCommitDetails(repoPath, hash));
   ipcMain.handle('repo:sync-start', (_event, options) => startSync(options));

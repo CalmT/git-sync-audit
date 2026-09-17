@@ -13,7 +13,7 @@ async function readSettingsFile() {
     return JSON.parse(await readFile(settingsPath(), 'utf8'));
   } catch (error) {
     if (error?.code === 'ENOENT') return {};
-    throw new Error('无法读取本地 AI 设置。');
+    throw new Error('无法读取本地应用设置。');
   }
 }
 
@@ -56,7 +56,8 @@ export async function loadAiSettings() {
 export async function saveAiSettings({ apiKey, model, rememberApiKey }) {
   const settings = await readSettingsFile();
   if (typeof apiKey === 'string' && apiKey.trim()) sessionApiKey = apiKey.trim();
-  const next = { model: model || settings.model || 'gpt-5.4-mini' };
+  const next = { ...settings, model: model || settings.model || 'gpt-5.4-mini' };
+  delete next.encryptedApiKey;
 
   if (rememberApiKey) {
     if (!sessionApiKey) throw new Error('请先填写 OpenAI API Key。');
@@ -89,6 +90,57 @@ export async function resolveApiKey(candidate) {
 export async function clearSavedApiKey() {
   sessionApiKey = '';
   const settings = await readSettingsFile();
-  await writeSettingsFile({ model: settings.model || 'gpt-5.4-mini' });
+  const next = { ...settings, model: settings.model || 'gpt-5.4-mini' };
+  delete next.encryptedApiKey;
+  await writeSettingsFile(next);
   return { model: settings.model || 'gpt-5.4-mini', rememberApiKey: false, hasApiKey: false };
+}
+
+function normalizedRepositories(settings) {
+  if (!Array.isArray(settings.recentRepositories)) return [];
+  return settings.recentRepositories
+    .filter((item) => item && typeof item.path === 'string' && path.isAbsolute(item.path))
+    .map((item) => ({
+      path: item.path,
+      name: typeof item.name === 'string' && item.name ? item.name : path.basename(item.path),
+      lastOpenedAt: typeof item.lastOpenedAt === 'string' ? item.lastOpenedAt : '',
+    }))
+    .slice(0, 8);
+}
+
+export async function loadRepositoryHistory() {
+  const settings = await readSettingsFile();
+  const recentRepositories = normalizedRepositories(settings);
+  const lastRepository = typeof settings.lastRepository === 'string'
+    && recentRepositories.some((item) => item.path === settings.lastRepository)
+    ? settings.lastRepository
+    : recentRepositories[0]?.path || null;
+  return { lastRepository, recentRepositories };
+}
+
+export async function rememberRepository({ path: repoPath, name }) {
+  if (typeof repoPath !== 'string' || !path.isAbsolute(repoPath)) throw new Error('仓库路径无效。');
+  const settings = await readSettingsFile();
+  const entry = {
+    path: repoPath,
+    name: typeof name === 'string' && name ? name : path.basename(repoPath),
+    lastOpenedAt: new Date().toISOString(),
+  };
+  const recentRepositories = [entry, ...normalizedRepositories(settings).filter((item) => item.path !== repoPath)].slice(0, 8);
+  await writeSettingsFile({ ...settings, lastRepository: repoPath, recentRepositories });
+  return { lastRepository: repoPath, recentRepositories };
+}
+
+export async function forgetRepository(repoPath) {
+  if (typeof repoPath !== 'string' || !path.isAbsolute(repoPath)) throw new Error('仓库路径无效。');
+  const settings = await readSettingsFile();
+  const recentRepositories = normalizedRepositories(settings).filter((item) => item.path !== repoPath);
+  const lastRepository = settings.lastRepository === repoPath
+    ? recentRepositories[0]?.path || null
+    : settings.lastRepository || recentRepositories[0]?.path || null;
+  const next = { ...settings, recentRepositories };
+  if (lastRepository) next.lastRepository = lastRepository;
+  else delete next.lastRepository;
+  await writeSettingsFile(next);
+  return { lastRepository, recentRepositories };
 }

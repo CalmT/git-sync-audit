@@ -9,6 +9,12 @@ export type RepositoryInfo = {
   isShallow: boolean;
 };
 
+export type RecentRepository = {
+  path: string;
+  name: string;
+  lastOpenedAt: string;
+};
+
 export type CommitStatus = 'missing' | 'equivalent' | 'unknown';
 
 export type CommitResult = {
@@ -108,6 +114,8 @@ export type SyncCompletion = {
 export type GitAuditApi = {
   selectRepository(): Promise<string | null>;
   inspectRepository(path: string): Promise<RepositoryInfo>;
+  loadRepositoryHistory(): Promise<{ lastRepository: string | null; recentRepositories: RecentRepository[] }>;
+  forgetRepository(path: string): Promise<{ lastRepository: string | null; recentRepositories: RecentRepository[] }>;
   compare(options: CompareOptions): Promise<AuditReport>;
   getCommitDetails(repoPath: string, hash: string): Promise<CommitDetails>;
   startSync(options: { repoPath: string; source: string; target: string; commitHashes: string[] }): Promise<SyncResult>;

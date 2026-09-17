@@ -27,7 +27,7 @@ import {
   UserRound,
   X,
 } from 'lucide-react';
-import type { AiReview, AuditReport, CommitDetails, CommitResult, CommitStatus, CompareOptions, RepositoryInfo, ReviewSeverity, SyncCompletion, SyncResult } from './types';
+import type { AiReview, AuditReport, CommitDetails, CommitResult, CommitStatus, CompareOptions, RecentRepository, RepositoryInfo, ReviewSeverity, SyncCompletion, SyncResult } from './types';
 import Lightfall from './components/Lightfall';
 
 const statusMeta: Record<CommitStatus, { label: string; className: string; icon: typeof AlertCircle }> = {
@@ -139,16 +139,30 @@ function DiffView({ diff }: { diff: string }) {
   );
 }
 
-function EmptyState({ onChoose }: { onChoose: () => void }) {
+function EmptyState({ recentRepositories, restoring, onChoose, onOpen, onForget }: {
+  recentRepositories: RecentRepository[];
+  restoring: boolean;
+  onChoose: () => void;
+  onOpen: (repoPath: string) => void;
+  onForget: (repoPath: string) => void;
+}) {
   return (
     <main className="welcome">
       <div className="welcome-mark"><GitBranch size={34} /></div>
       <div className="eyebrow">LOCAL · SAFE · EXPLAINABLE</div>
       <h1>找出没有同步的提交</h1>
       <p>比较两个 Git 分支，识别真正遗漏的改动，同时排除 cherry-pick 和 rebase 造成的假象。</p>
-      <button className="primary large" onClick={onChoose}>
-        <FolderGit2 size={19} /> 选择本地仓库
+      <button className="primary large" disabled={restoring} onClick={onChoose}>
+        {restoring ? <LoaderCircle className="spin" size={19} /> : <FolderGit2 size={19} />}
+        {restoring ? '正在打开上次的仓库…' : '选择本地仓库'}
       </button>
+      {recentRepositories.length > 0 && !restoring && <div className="recent-repositories">
+        <div className="recent-heading"><span>最近仓库</span><small>启动时自动打开最近一次使用的仓库</small></div>
+        {recentRepositories.map((item) => <div className="recent-repository" key={item.path}>
+          <button className="recent-open" title={item.path} onClick={() => onOpen(item.path)}><FolderGit2 size={16} /><span><strong>{item.name}</strong><small>{item.path}</small></span></button>
+          <button className="recent-forget" title="从最近记录中移除" onClick={() => onForget(item.path)}><X size={14} /></button>
+        </div>)}
+      </div>}
       <div className="promise-row">
         <span><ShieldCheck size={16} /> 只读检查</span>
         <span><Code2 size={16} /> 本地运行</span>
@@ -196,6 +210,36 @@ export default function App() {
   const [syncBusy, setSyncBusy] = useState(false);
   const [syncResult, setSyncResult] = useState<SyncResult | null>(null);
   const [syncCompletion, setSyncCompletion] = useState<SyncCompletion | null>(null);
+  const [recentRepositories, setRecentRepositories] = useState<RecentRepository[]>([]);
+  const [restoringRepository, setRestoringRepository] = useState(true);
+
+  const loadRepository = async (repoPath: string, restoring = false) => {
+    setBusy(true);
+    if (restoring) setRestoringRepository(true);
+    setError('');
+    try {
+      const info = await window.gitAudit.inspectRepository(repoPath);
+      setRepo(info);
+      setSource(info.currentBranch || info.branches[0] || '');
+      const fallback = info.branches.find((branch) => branch !== info.currentBranch) || '';
+      setTarget(fallback);
+      setReport(null);
+      setSelected(null);
+      setDetails(null);
+      setAiReview(null);
+      setSyncSelection(new Set());
+      const history = await window.gitAudit.loadRepositoryHistory();
+      setRecentRepositories(history.recentRepositories);
+    } catch (cause) {
+      setRepo(null);
+      setError(restoring
+        ? `无法自动打开上次使用的仓库：${readableError(cause)}`
+        : readableError(cause));
+    } finally {
+      setBusy(false);
+      if (restoring) setRestoringRepository(false);
+    }
+  };
 
   useEffect(() => {
     window.gitAudit.loadAiSettings().then((settings) => {
@@ -209,26 +253,29 @@ export default function App() {
     });
   }, []);
 
+  useEffect(() => {
+    window.gitAudit.loadRepositoryHistory().then((history) => {
+      setRecentRepositories(history.recentRepositories);
+      if (history.lastRepository) void loadRepository(history.lastRepository, true);
+      else setRestoringRepository(false);
+    }).catch((cause) => {
+      setRestoringRepository(false);
+      setError(readableError(cause));
+    });
+  }, []);
+
   const chooseRepository = async () => {
     const path = await window.gitAudit.selectRepository();
     if (!path) return;
-    setBusy(true);
-    setError('');
+    await loadRepository(path);
+  };
+
+  const forgetRecentRepository = async (repoPath: string) => {
     try {
-      const info = await window.gitAudit.inspectRepository(path);
-      setRepo(info);
-      setSource(info.currentBranch || info.branches[0] || '');
-      const fallback = info.branches.find((branch) => branch !== info.currentBranch) || '';
-      setTarget(fallback);
-      setReport(null);
-      setSelected(null);
-      setDetails(null);
-      setAiReview(null);
-      setSyncSelection(new Set());
+      const history = await window.gitAudit.forgetRepository(repoPath);
+      setRecentRepositories(history.recentRepositories);
     } catch (cause) {
-      setError(cause instanceof Error ? cause.message : String(cause));
-    } finally {
-      setBusy(false);
+      setError(readableError(cause));
     }
   };
 
@@ -484,7 +531,7 @@ export default function App() {
         <div className="error-banner"><AlertCircle size={17} /><span>{error}</span><button onClick={() => setError('')}><X size={16} /></button></div>
       )}
 
-      {!repo ? <EmptyState onChoose={chooseRepository} /> : (
+      {!repo ? <EmptyState recentRepositories={recentRepositories} restoring={restoringRepository} onChoose={chooseRepository} onOpen={(repoPath) => void loadRepository(repoPath)} onForget={(repoPath) => void forgetRecentRepository(repoPath)} /> : (
         <div className={`workspace ${detailsExpanded ? 'details-expanded' : ''}`}>
           <aside className="control-panel">
             <div className="panel-heading"><div><span>检查条件</span><p>定义提交的同步方向</p></div><Settings2 size={19} /></div>

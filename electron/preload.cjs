@@ -3,6 +3,8 @@ const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('gitAudit', {
   selectRepository: () => ipcRenderer.invoke('repo:select'),
   inspectRepository: (path) => ipcRenderer.invoke('repo:inspect', path),
+  loadRepositoryHistory: () => ipcRenderer.invoke('repo:history'),
+  forgetRepository: (path) => ipcRenderer.invoke('repo:forget', path),
   compare: (options) => ipcRenderer.invoke('repo:compare', options),
   getCommitDetails: (repoPath, hash) => ipcRenderer.invoke('repo:commit-details', repoPath, hash),
   startSync: (options) => ipcRenderer.invoke('repo:sync-start', options),
