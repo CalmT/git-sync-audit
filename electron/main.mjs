@@ -1,7 +1,7 @@
 import { app, BrowserWindow, dialog, ipcMain, net } from 'electron';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { abortSync, compareBranches, finalizeSync, getCommitDetails, inspectRepository, startSync } from './git-service.mjs';
+import { abortSync, compareBranches, fetchRemoteBranches, finalizeSync, getCommitDetails, inspectRepository, pushLocalBranch, startSync } from './git-service.mjs';
 import { listAvailableModels, reviewCommit } from './ai-review-service.mjs';
 import { clearSavedApiKey, forgetRepository, loadAiSettings, loadRepositoryHistory, rememberRepository, resolveApiKey, saveAiSettings } from './settings-store.mjs';
 import { writeFile } from 'node:fs/promises';
@@ -48,6 +48,8 @@ function registerHandlers() {
   ipcMain.handle('repo:history', () => loadRepositoryHistory());
   ipcMain.handle('repo:forget', (_event, repoPath) => forgetRepository(repoPath));
   ipcMain.handle('repo:compare', (_event, options) => compareBranches(options));
+  ipcMain.handle('repo:fetch-remotes', (_event, repoPath) => fetchRemoteBranches(repoPath));
+  ipcMain.handle('repo:push-branch', (_event, repoPath, branch) => pushLocalBranch(repoPath, branch));
   ipcMain.handle('repo:commit-details', (_event, repoPath, hash) => getCommitDetails(repoPath, hash));
   ipcMain.handle('repo:sync-start', (_event, options) => startSync(options));
   ipcMain.handle('repo:sync-finalize', (_event, operationId) => finalizeSync(operationId));

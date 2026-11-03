@@ -6,6 +6,8 @@ contextBridge.exposeInMainWorld('gitAudit', {
   loadRepositoryHistory: () => ipcRenderer.invoke('repo:history'),
   forgetRepository: (path) => ipcRenderer.invoke('repo:forget', path),
   compare: (options) => ipcRenderer.invoke('repo:compare', options),
+  fetchRemotes: (repoPath) => ipcRenderer.invoke('repo:fetch-remotes', repoPath),
+  pushBranch: (repoPath, branch) => ipcRenderer.invoke('repo:push-branch', repoPath, branch),
   getCommitDetails: (repoPath, hash) => ipcRenderer.invoke('repo:commit-details', repoPath, hash),
   startSync: (options) => ipcRenderer.invoke('repo:sync-start', options),
   finalizeSync: (operationId) => ipcRenderer.invoke('repo:sync-finalize', operationId),

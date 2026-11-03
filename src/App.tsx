@@ -97,6 +97,19 @@ function FieldLabel({ children }: { children: React.ReactNode }) {
   return <label className="field-label">{children}</label>;
 }
 
+function BranchOptions({ repository }: { repository: RepositoryInfo }) {
+  return (
+    <>
+      {repository.localBranches.length > 0 && <optgroup label="本地分支">
+        {repository.localBranches.map((branch) => <option key={`local-${branch}`} value={branch}>{branch}</option>)}
+      </optgroup>}
+      {repository.remoteBranches.length > 0 && <optgroup label="远端跟踪分支（只读引用）">
+        {repository.remoteBranches.map((branch) => <option key={`remote-${branch}`} value={branch}>{branch}</option>)}
+      </optgroup>}
+    </>
+  );
+}
+
 function DiffView({ diff }: { diff: string }) {
   let oldLine = 0;
   let newLine = 0;
@@ -210,8 +223,13 @@ export default function App() {
   const [syncBusy, setSyncBusy] = useState(false);
   const [syncResult, setSyncResult] = useState<SyncResult | null>(null);
   const [syncCompletion, setSyncCompletion] = useState<SyncCompletion | null>(null);
+  const [pushConsent, setPushConsent] = useState(false);
+  const [pushingBranch, setPushingBranch] = useState(false);
+  const [pushResult, setPushResult] = useState<{ remoteRef: string; pushedHash: string } | null>(null);
   const [recentRepositories, setRecentRepositories] = useState<RecentRepository[]>([]);
   const [loadingRepositoryHistory, setLoadingRepositoryHistory] = useState(true);
+  const [fetchingRemotes, setFetchingRemotes] = useState(false);
+  const [lastFetchedAt, setLastFetchedAt] = useState('');
 
   const loadRepository = async (repoPath: string) => {
     setBusy(true);
@@ -219,9 +237,12 @@ export default function App() {
     try {
       const info = await window.gitAudit.inspectRepository(repoPath);
       setRepo(info);
-      setSource(info.currentBranch || info.branches[0] || '');
-      const fallback = info.branches.find((branch) => branch !== info.currentBranch) || '';
+      setSource(info.currentBranch || info.localBranches[0] || info.remoteBranches[0] || '');
+      const fallback = info.localBranches.find((branch) => branch !== info.currentBranch)
+        || info.remoteBranches.find((branch) => branch !== info.currentBranch)
+        || '';
       setTarget(fallback);
+      setLastFetchedAt('');
       setReport(null);
       setSelected(null);
       setDetails(null);
@@ -265,6 +286,38 @@ export default function App() {
     await loadRepository(path);
   };
 
+  const switchRepository = () => {
+    setRepo(null);
+    setReport(null);
+    setSelected(null);
+    setDetails(null);
+    setAiReview(null);
+    setSyncSelection(new Set());
+    setSyncOpen(false);
+    setPushConsent(false);
+    setPushResult(null);
+    setError('');
+  };
+
+  const refreshRemotes = async () => {
+    if (!repo) return;
+    setFetchingRemotes(true);
+    setError('');
+    try {
+      const refreshed = await window.gitAudit.fetchRemotes(repo.root);
+      setRepo(refreshed.repository);
+      setLastFetchedAt(refreshed.fetchedAt);
+      setReport(null);
+      setSelected(null);
+      setDetails(null);
+      setSyncSelection(new Set());
+    } catch (cause) {
+      setError(readableError(cause));
+    } finally {
+      setFetchingRemotes(false);
+    }
+  };
+
   const forgetRecentRepository = async (repoPath: string) => {
     try {
       const history = await window.gitAudit.forgetRepository(repoPath);
@@ -295,7 +348,7 @@ export default function App() {
       };
       const nextReport = await window.gitAudit.compare(options);
       setReport(nextReport);
-      setStatusFilter('all');
+      setStatusFilter('missing');
       setSyncSelection(new Set());
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : String(cause));
@@ -418,6 +471,7 @@ export default function App() {
     () => (report?.results ?? []).filter((item) => item.status === 'missing' && syncSelection.has(item.hash)),
     [report, syncSelection],
   );
+  const targetIsLocal = Boolean(repo?.localBranches.includes(report?.target ?? target));
 
   const toggleSyncCommit = (hash: string) => {
     setSyncSelection((current) => {
@@ -434,6 +488,10 @@ export default function App() {
   };
 
   const openSync = () => {
+    if (!targetIsLocal) {
+      setError('远端跟踪分支是只读引用。请把目标分支切换为对应的本地分支，再执行同步。');
+      return;
+    }
     if (!selectedSyncCommits.length) {
       setError('请先勾选至少一个确认漏同步的提交。');
       return;
@@ -441,6 +499,8 @@ export default function App() {
     setSyncConsent(false);
     setSyncResult(null);
     setSyncCompletion(null);
+    setPushConsent(false);
+    setPushResult(null);
     setSyncOpen(true);
   };
 
@@ -476,6 +536,24 @@ export default function App() {
       setError(readableError(cause));
     } finally {
       setSyncBusy(false);
+    }
+  };
+
+  const pushSyncedTarget = async () => {
+    if (!repo || !syncCompletion || !pushConsent) return;
+    setPushingBranch(true);
+    setError('');
+    try {
+      const pushed = await window.gitAudit.pushBranch(repo.root, syncCompletion.target);
+      setPushResult({ remoteRef: pushed.remoteRef, pushedHash: pushed.pushedHash });
+      const refreshed = await window.gitAudit.fetchRemotes(repo.root);
+      setRepo(refreshed.repository);
+      setLastFetchedAt(refreshed.fetchedAt);
+      await runAudit();
+    } catch (cause) {
+      setError(readableError(cause));
+    } finally {
+      setPushingBranch(false);
     }
   };
 
@@ -517,7 +595,7 @@ export default function App() {
         )}
         <div className="topbar-actions">
           <button className="ghost" onClick={() => setSettingsOpen(true)}><BrainCircuit size={16} /> AI 设置</button>
-          {repo && <button className="ghost" onClick={chooseRepository}><RefreshCw size={16} /> 更换仓库</button>}
+          {repo && <button className="ghost" onClick={switchRepository}><RefreshCw size={16} /> 切换仓库</button>}
           <span className="read-only"><ShieldCheck size={15} /> 检查只读 · 同步需确认</span>
         </div>
       </header>
@@ -533,14 +611,20 @@ export default function App() {
 
             {repo.isShallow && <div className="shallow-warning"><AlertCircle size={16} /> 当前是浅克隆，结果可能不完整。</div>}
 
+            <div className="remote-refresh">
+              <div><strong>远端引用</strong><span>{lastFetchedAt ? `上次刷新 ${formatDate(lastFetchedAt)}` : '尚未在本次会话刷新'}</span></div>
+              <button className="secondary" disabled={fetchingRemotes} onClick={refreshRemotes}>{fetchingRemotes ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}{fetchingRemotes ? '刷新中' : '刷新'}</button>
+            </div>
+
             <div className="field">
               <FieldLabel>源分支</FieldLabel>
-              <div className="select-wrap"><GitBranch size={16} /><select value={source} onChange={(e) => setSource(e.target.value)}>{repo.branches.map((branch) => <option key={branch}>{branch}</option>)}</select><ChevronDown size={15} /></div>
+              <div className="select-wrap"><GitBranch size={16} /><select value={source} onChange={(e) => setSource(e.target.value)}><BranchOptions repository={repo} /></select><ChevronDown size={15} /></div>
             </div>
             <div className="direction"><span /><ArrowRight size={16} /><span /></div>
             <div className="field">
               <FieldLabel>目标分支</FieldLabel>
-              <div className="select-wrap"><GitBranch size={16} /><select value={target} onChange={(e) => setTarget(e.target.value)}>{repo.branches.map((branch) => <option key={branch}>{branch}</option>)}</select><ChevronDown size={15} /></div>
+              <div className="select-wrap"><GitBranch size={16} /><select value={target} onChange={(e) => setTarget(e.target.value)}><BranchOptions repository={repo} /></select><ChevronDown size={15} /></div>
+              {repo.remoteBranches.includes(target) && <p className="remote-target-note">这是远端跟踪引用，可用于检查，但不能直接同步。刷新后才能反映远端最新状态。</p>}
             </div>
 
             <div className="divider" />
@@ -564,7 +648,7 @@ export default function App() {
                 <button className={mode === 'patch' ? 'active' : ''} onClick={() => setMode('patch')}>补丁等价<span>推荐</span></button>
                 <button className={mode === 'strict' ? 'active' : ''} onClick={() => setMode('strict')}>严格 SHA</button>
               </div>
-              <p className="field-help">补丁等价模式可识别 cherry-pick 或 rebase 后的相同改动。</p>
+              <p className={`field-help ${mode === 'strict' ? 'strict-warning' : ''}`}>{mode === 'patch' ? '补丁等价模式可识别 cherry-pick 或 rebase 后的相同改动。' : '严格 SHA 只认原始提交 ID；cherry-pick 后即使代码相同也会显示待同步。'}</p>
             </div>
             <label className="check-row"><input type="checkbox" checked={includeMerges} onChange={(e) => setIncludeMerges(e.target.checked)} /><span>包含合并提交</span></label>
 
@@ -602,7 +686,7 @@ export default function App() {
                   <div className="search-box"><Search size={16} /><input placeholder="搜索提交、作者或文件…" value={search} onChange={(e) => setSearch(e.target.value)} />{search && <button onClick={() => setSearch('')}><X size={14} /></button>}</div>
                   <div className="sync-toolbar">
                     {report.summary.missing > 0 && <button className="select-missing" onClick={toggleAllMissing}>{syncSelection.size === report.summary.missing ? '取消全选' : '选择全部漏同步'}</button>}
-                    <button className="sync-trigger" disabled={selectedSyncCommits.length === 0} onClick={openSync}><GitMerge size={14} /> 安全同步{selectedSyncCommits.length ? ` (${selectedSyncCommits.length})` : ''}</button>
+                    <button className="sync-trigger" title={targetIsLocal ? '同步到本地目标分支' : '远端跟踪分支不能直接同步'} disabled={selectedSyncCommits.length === 0 || !targetIsLocal} onClick={openSync}><GitMerge size={14} /> 安全同步{selectedSyncCommits.length ? ` (${selectedSyncCommits.length})` : ''}</button>
                     <span>{filteredResults.length} 条记录</span>
                   </div>
                 </div>
@@ -690,7 +774,15 @@ export default function App() {
                 <h3>同步已完成</h3>
                 <p>{syncCompletion.appliedCommits.length} 个提交已经安全地应用到本地目标分支 <code>{syncCompletion.target}</code>。</p>
                 <div className="sync-hash-route"><code>{syncCompletion.previousHash.slice(0, 8)}</code><ArrowRight size={15} /><code>{syncCompletion.resultHash.slice(0, 8)}</code></div>
-                <p className="sync-no-push"><ShieldCheck size={13} /> 仅更新本地分支，没有推送远程仓库。</p>
+                {pushResult ? (
+                  <div className="push-success"><Check size={15} /><span>已推送到 <code>{pushResult.remoteRef}</code>，并刷新远端引用。</span></div>
+                ) : (
+                  <div className="push-step">
+                    <p className="sync-no-push"><ShieldCheck size={13} /> 当前仅更新了本地分支，远端检查结果尚不会变化。</p>
+                    <label className="sync-consent"><input type="checkbox" checked={pushConsent} onChange={(event) => setPushConsent(event.target.checked)} /><span>我确认将本地分支 <code>{syncCompletion.target}</code> 普通推送到它的上游分支（不会强制推送）</span></label>
+                    <button className="secondary push-button" disabled={!pushConsent || pushingBranch} onClick={pushSyncedTarget}>{pushingBranch ? <LoaderCircle className="spin" size={15} /> : <GitBranch size={15} />}{pushingBranch ? '正在推送…' : '推送到远端'}</button>
+                  </div>
+                )}
                 <button className="primary modal-save" onClick={() => setSyncOpen(false)}>完成</button>
               </div>
             ) : !syncResult ? (

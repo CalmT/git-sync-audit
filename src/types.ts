@@ -5,6 +5,8 @@ export type RepositoryInfo = {
   name: string;
   currentBranch: string;
   branches: string[];
+  localBranches: string[];
+  remoteBranches: string[];
   authors: Author[];
   isShallow: boolean;
 };
@@ -117,6 +119,8 @@ export type GitAuditApi = {
   loadRepositoryHistory(): Promise<{ recentRepositories: RecentRepository[] }>;
   forgetRepository(path: string): Promise<{ recentRepositories: RecentRepository[] }>;
   compare(options: CompareOptions): Promise<AuditReport>;
+  fetchRemotes(repoPath: string): Promise<{ repository: RepositoryInfo; remotes: string[]; fetchedAt: string }>;
+  pushBranch(repoPath: string, branch: string): Promise<{ branch: string; remote: string; remoteBranch: string; remoteRef: string; pushedHash: string; pushedAt: string }>;
   getCommitDetails(repoPath: string, hash: string): Promise<CommitDetails>;
   startSync(options: { repoPath: string; source: string; target: string; commitHashes: string[] }): Promise<SyncResult>;
   finalizeSync(operationId: string): Promise<SyncCompletion>;

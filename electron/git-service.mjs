@@ -117,6 +117,10 @@ export async function inspectRepository(repoPath) {
     })
     .filter((name) => !name.endsWith('/HEAD'))
     .sort((a, b) => a.localeCompare(b));
+  const localBranchOutput = await runGit(root, ['for-each-ref', '--format=%(refname:short)', 'refs/heads']);
+  const remoteBranchOutput = await runGit(root, ['for-each-ref', '--format=%(refname:short)', 'refs/remotes']);
+  const localBranchNames = localBranchOutput.split('\n').filter(Boolean).sort((a, b) => a.localeCompare(b));
+  const remoteBranchNames = remoteBranchOutput.split('\n').filter(Boolean).filter((name) => !name.endsWith('/HEAD')).sort((a, b) => a.localeCompare(b));
 
   const authorOutput = await runGit(root, ['log', '--all', '--format=%aN%x00%aE']);
   const authorMap = new Map();
@@ -131,8 +135,46 @@ export async function inspectRepository(repoPath) {
     name: path.basename(root),
     currentBranch,
     branches,
+    localBranches: localBranchNames,
+    remoteBranches: remoteBranchNames,
     authors: [...authorMap.values()].sort((a, b) => a.name.localeCompare(b.name)),
     isShallow: (await runGit(root, ['rev-parse', '--is-shallow-repository'])).trim() === 'true',
+  };
+}
+
+export async function fetchRemoteBranches(repoPath) {
+  const repository = await inspectRepository(repoPath);
+  const remotes = (await runGit(repository.root, ['remote'])).split('\n').filter(Boolean);
+  if (remotes.length === 0) throw new Error('当前仓库没有配置远端仓库。');
+  await runGit(repository.root, ['fetch', '--all', '--prune']);
+  return {
+    repository: await inspectRepository(repository.root),
+    remotes,
+    fetchedAt: new Date().toISOString(),
+  };
+}
+
+export async function pushLocalBranch(repoPath, branch) {
+  const repository = await inspectRepository(repoPath);
+  assertRef(branch, repository.localBranches);
+  const tracking = await runGit(repository.root, [
+    'for-each-ref',
+    '--format=%(upstream:remotename)%00%(upstream:remoteref)',
+    `refs/heads/${branch}`,
+  ]);
+  const [remote, remoteRef] = tracking.trim().split('\0');
+  if (!remote || !remoteRef?.startsWith('refs/heads/')) {
+    throw new Error(`本地分支 ${branch} 没有配置上游分支，请先使用 Git 配置 upstream。`);
+  }
+  const remoteBranch = remoteRef.slice('refs/heads/'.length);
+  await runGit(repository.root, ['push', remote, `refs/heads/${branch}:refs/heads/${remoteBranch}`]);
+  return {
+    branch,
+    remote,
+    remoteBranch,
+    remoteRef: `${remote}/${remoteBranch}`,
+    pushedHash: (await runGit(repository.root, ['rev-parse', branch])).trim(),
+    pushedAt: new Date().toISOString(),
   };
 }
 
@@ -151,6 +193,102 @@ function parseLog(output) {
       files: fileLines.filter(Boolean),
     };
   });
+}
+
+function normalizeSubject(subject) {
+  return subject.trim().toLocaleLowerCase().replace(/\s*([:：])\s*/g, '$1');
+}
+
+function migrationFileIdentity(file) {
+  if (!/(?:^|\/)V\d+(?:\.\d+)+_patch\//i.test(file)) return null;
+  const match = path.basename(file).match(/^_(\d+)_([^/]+)$/);
+  if (!match) return null;
+  return { migrationId: match[1], logicalName: match[2] };
+}
+
+function normalizeMigrationContent(content, migrationId) {
+  return content
+    .replace(/^\uFEFF/, '')
+    .replaceAll('\r\n', '\n')
+    .replaceAll(migrationId, 'MIGRATION_ID')
+    .replace(/(EMigrationPatch\()\d+(,\s*MIGRATION_ID\b)/g, '$1BASE_MIGRATION_ID$2')
+    .replace(/V\d+(?:\.\d+)+_patch/gi, 'VERSION_patch')
+    .trimEnd();
+}
+
+async function addedFilesForCommit(repoPath, hash) {
+  const output = await runGit(repoPath, ['diff-tree', '--root', '--no-commit-id', '--name-status', '-r', hash]);
+  const entries = output.split('\n').filter(Boolean).map((line) => {
+    const [status, ...fileParts] = line.split('\t');
+    return { status, file: fileParts.join('\t') };
+  });
+  if (!entries.length || entries.some((entry) => entry.status !== 'A')) return null;
+  return entries.map((entry) => entry.file);
+}
+
+async function versionedMigrationEquivalent(repoPath, sourceCommit, candidateHash) {
+  const [sourceFiles, targetFiles] = await Promise.all([
+    addedFilesForCommit(repoPath, sourceCommit.hash),
+    addedFilesForCommit(repoPath, candidateHash),
+  ]);
+  if (!sourceFiles) return false;
+  if (!targetFiles || sourceFiles.length !== targetFiles.length) return false;
+
+  const sourceMap = new Map();
+  for (const file of sourceFiles) {
+    const identity = migrationFileIdentity(file);
+    if (!identity || sourceMap.has(identity.logicalName)) return false;
+    sourceMap.set(identity.logicalName, { file, ...identity });
+  }
+  const targetMap = new Map();
+  for (const file of targetFiles) {
+    const identity = migrationFileIdentity(file);
+    if (!identity || targetMap.has(identity.logicalName)) return false;
+    targetMap.set(identity.logicalName, { file, ...identity });
+  }
+  if ([...sourceMap.keys()].some((name) => !targetMap.has(name))) return false;
+
+  for (const [name, source] of sourceMap) {
+    const target = targetMap.get(name);
+    const [sourceContent, targetContent] = await Promise.all([
+      runGit(repoPath, ['show', `${sourceCommit.hash}:${source.file}`]),
+      runGit(repoPath, ['show', `${candidateHash}:${target.file}`]),
+    ]);
+    if (normalizeMigrationContent(sourceContent, source.migrationId)
+      !== normalizeMigrationContent(targetContent, target.migrationId)) return false;
+  }
+  return true;
+}
+
+async function findVersionedMigrationEquivalents(repoPath, target, commits, patchStatuses) {
+  const candidates = commits.filter((commit) => patchStatuses.get(commit.hash) === 'missing'
+    && commit.files.length > 0
+    && commit.files.every((file) => migrationFileIdentity(file)));
+  if (!candidates.length) return new Map();
+
+  const targetLog = await runGit(repoPath, ['log', target, '--no-merges', '--format=%H%x1f%s']);
+  const subjects = new Map();
+  for (const line of targetLog.split('\n')) {
+    if (!line) continue;
+    const separator = line.indexOf('\x1f');
+    if (separator < 0) continue;
+    const hash = line.slice(0, separator);
+    const subject = normalizeSubject(line.slice(separator + 1));
+    const hashes = subjects.get(subject) ?? [];
+    if (hashes.length < 20) hashes.push(hash);
+    subjects.set(subject, hashes);
+  }
+
+  const equivalents = new Map();
+  for (const commit of candidates) {
+    for (const candidateHash of subjects.get(normalizeSubject(commit.subject)) ?? []) {
+      if (await versionedMigrationEquivalent(repoPath, commit, candidateHash)) {
+        equivalents.set(commit.hash, candidateHash);
+        break;
+      }
+    }
+  }
+  return equivalents;
 }
 
 async function cherryStatus(repoPath, source, target) {
@@ -188,11 +326,18 @@ export async function compareBranches(options) {
 
   const commits = parseLog(await runGit(repo.root, args));
   const patchStatuses = mode === 'patch' ? await cherryStatus(repo.root, source, target) : new Map();
+  const migrationEquivalents = mode === 'patch'
+    ? await findVersionedMigrationEquivalents(repo.root, target, commits, patchStatuses)
+    : new Map();
   const results = commits.map((commit) => ({
     ...commit,
-    status: mode === 'patch' ? (patchStatuses.get(commit.hash) ?? 'unknown') : 'missing',
+    status: mode === 'patch'
+      ? (migrationEquivalents.has(commit.hash) ? 'equivalent' : (patchStatuses.get(commit.hash) ?? 'unknown'))
+      : 'missing',
     reason: mode === 'patch'
-      ? patchStatuses.get(commit.hash) === 'equivalent'
+      ? migrationEquivalents.has(commit.hash)
+        ? `目标分支提交 ${migrationEquivalents.get(commit.hash).slice(0, 8)} 中存在版本路径与迁移编号不同、内容等价的脚本`
+        : patchStatuses.get(commit.hash) === 'equivalent'
         ? '目标分支中存在补丁内容等价的提交'
         : patchStatuses.has(commit.hash)
           ? '目标分支中未发现相同提交或等价补丁'
